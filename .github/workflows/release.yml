@@ -93,8 +93,9 @@ jobs:
       - name: Test and build static binary
         env:
           TARGET: ${{ matrix.target }}
+          CC: musl-gcc
         run: |
-          cargo +"$RUST_VERSION" test --locked --all-targets
+          cargo +"$RUST_VERSION" test --locked --release --target "$TARGET" --all-targets
           cargo +"$RUST_VERSION" build --release --locked --target "$TARGET"
           "target/$TARGET/release/agent-auth" --version
           if readelf -l "target/$TARGET/release/agent-auth" | grep -q INTERP; then
