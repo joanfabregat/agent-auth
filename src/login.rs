@@ -396,7 +396,10 @@ pub async fn revoke(client_file: PathBuf, session: PathBuf) -> AppResult<()> {
                 // success merely because a local config was deleted.
                 let rotated = Grant {
                     access_token: rotated.access_token().secret().clone(),
-                    refresh_token: rotated.refresh_token().map(|value| value.secret().clone()),
+                    refresh_token: rotated
+                        .refresh_token()
+                        .map(|value| value.secret().clone())
+                        .or(grant.refresh_token),
                     ..grant
                 };
                 storage::replace_secret(
