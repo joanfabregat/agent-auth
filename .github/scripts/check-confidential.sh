@@ -22,7 +22,7 @@ done < <(git ls-files --cached --others --exclude-standard -z)
 # Keep history in a pipe; grep consumes the whole stream
 # to avoid SIGPIPE being mistaken for a clean scan under pipefail.
 set +e
-git log --all --format= --patch --no-ext-diff --no-textconv | LC_ALL=C grep -E -- "$pattern" >/dev/null
+git log --all --format=fuller --patch --no-ext-diff --no-textconv | LC_ALL=C grep -E -- "$pattern" >/dev/null
 statuses=("${PIPESTATUS[@]}")
 set -e
 if [[ ${statuses[0]} -ne 0 || ${statuses[1]} -gt 1 ]]; then
