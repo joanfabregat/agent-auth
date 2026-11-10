@@ -1,0 +1,17 @@
+/target/
+/.env
+/.env.*
+*.enc.yaml
+*.enc.json
+*.pem
+*.key
+/runtime/
+/sessions/
+**/client.json
+**/client-secret.json
+**/grant.json
+**/rotated-grant.json
+**/control.token
+**/access-token
+**/doctl.yaml
+*.sarif
