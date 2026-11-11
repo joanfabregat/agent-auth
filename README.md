@@ -4,13 +4,13 @@
 [![CI](https://github.com/joanfabregat/agent-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/joanfabregat/agent-auth/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/joanfabregat/agent-auth/actions/workflows/codeql.yml/badge.svg)](https://github.com/joanfabregat/agent-auth/actions/workflows/codeql.yml)
 [![Rust edition](https://img.shields.io/badge/Rust-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
-[![Status](https://img.shields.io/badge/status-early%20development-yellow.svg)](https://github.com/joanfabregat/agent-auth)
+[![Status](https://img.shields.io/badge/status-experimental%20beta-yellow.svg)](https://github.com/joanfabregat/agent-auth/releases)
 
 Browser-approved OAuth for cloud command-line tools running on a remote agent host.
 
 Cloud CLIs commonly redirect browser approval to `localhost`. That works when the browser and CLI share a machine, but a browser on your laptop cannot reach a listener bound to the remote agent host's loopback interface. `agent-auth` provides a shared HTTPS callback address that your browser can reach, so approval can finish without copying callback URLs into a conversation or forwarding a new SSH port for every login.
 
-**Status:** early development. The relay, login client, and revocation command are implemented and covered by local tests. There are no published releases, hosted authentication service, or production-readiness claim yet. Google and DigitalOcean login and revocation still need validation against real accounts before deployment.
+**Status:** experimental beta. The relay, login client, and revocation command are implemented and covered by local tests. [Versioned builds](https://github.com/joanfabregat/agent-auth/releases) are intended for controlled testing; this project does not provide a hosted authentication service or claim production readiness. Google and DigitalOcean login and revocation still need validation against real accounts before administrative use.
 
 ## Intended workflow
 
@@ -145,7 +145,7 @@ See [SECURITY.md](SECURITY.md) for private vulnerability reporting, trust bounda
 
 - Validate Google Cloud and DigitalOcean login, identity checks, credential handoff, expiry, and revocation.
 - Complete deployment supervision and integration with existing cloud wrappers.
-- Publish versioned releases after those checks pass.
+- Publish a stable release after those checks pass.
 
 ## License
 
