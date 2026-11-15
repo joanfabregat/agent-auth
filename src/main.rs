@@ -13,6 +13,12 @@ const MAX_PENDING: usize = 128;
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+fn random_token() -> oauth2::CsrfToken {
+    // The relay requires at least 32 URL-safe characters. oauth2's default
+    // uses 16 random bytes (22 encoded characters), which it would reject.
+    oauth2::CsrfToken::new_random_len(32)
+}
+
 #[derive(Clone, Copy, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Provider {

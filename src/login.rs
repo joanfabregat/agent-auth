@@ -4,8 +4,8 @@ use crate::{
     storage,
 };
 use oauth2::{
-    AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet,
-    EndpointSet, PkceCodeChallenge, RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
+    AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, EndpointNotSet, EndpointSet,
+    PkceCodeChallenge, RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
     basic::BasicClient,
 };
 use serde::{Deserialize, Serialize};
@@ -202,7 +202,7 @@ pub async fn run(
     let deadline = now()? + 45 * 60;
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
     let mut request = client
-        .authorize_url(CsrfToken::new_random)
+        .authorize_url(crate::random_token)
         .set_pkce_challenge(challenge);
     let scopes: &[&str] = match provider {
         Provider::Google => &[
@@ -223,7 +223,7 @@ pub async fn run(
             .add_extra_param("prompt", "select_account");
     }
     let (url, csrf) = request.url();
-    let wait_token = CsrfToken::new_random().secret().clone();
+    let wait_token = crate::random_token().secret().clone();
     let registered = http
         .post(control.join("v1/sessions")?)
         .bearer_auth(&token)
