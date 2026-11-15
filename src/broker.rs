@@ -6,7 +6,6 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use oauth2::CsrfToken;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -99,7 +98,7 @@ async fn register(
     if inner.pending.contains_key(&input.state) {
         return Err(StatusCode::CONFLICT);
     }
-    let id = CsrfToken::new_random().secret().clone();
+    let id = crate::random_token().secret().clone();
     let (sender, receiver) = oneshot::channel();
     inner.pending.insert(
         input.state,
@@ -267,7 +266,7 @@ pub async fn serve(
         storage::read_secret(&token_file)?;
         std::fs::remove_file(&token_file)?;
     }
-    let control_token = CsrfToken::new_random().secret().clone();
+    let control_token = crate::random_token().secret().clone();
     storage::write_new(&token_file, control_token.as_bytes())?;
     let broker = Arc::new(Broker {
         control_token,
@@ -351,6 +350,45 @@ mod tests {
             wait_token: "b".repeat(43),
             provider: Provider::Google,
         }
+    }
+
+    #[tokio::test]
+    async fn accepts_generated_login_state_and_wait_token() {
+        let broker = broker();
+        let state = crate::random_token().secret().clone();
+        let wait_token = crate::random_token().secret().clone();
+        let Json(registered) = register(
+            State(broker.clone()),
+            headers(),
+            Json(Registration {
+                provider: Provider::Digitalocean,
+                state: state.clone(),
+                wait_token: wait_token.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let response = callback(
+            State(broker.clone()),
+            Path("digitalocean".into()),
+            Query(Callback {
+                state: Some(state),
+                code: Some("synthetic-approval".into()),
+                error: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let Json(outcome) = wait(
+            State(broker),
+            headers(),
+            Path(registered.id),
+            Json(WaitRequest { wait_token }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.code.as_deref(), Some("synthetic-approval"));
+        assert!(!outcome.denied);
     }
 
     #[tokio::test]
