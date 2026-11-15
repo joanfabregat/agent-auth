@@ -8,7 +8,9 @@ Report security problems privately as described in [SECURITY.md](SECURITY.md). D
 
 The `main` ruleset requires pull requests, signed commits, linear history, resolved review threads, and required CI checks. Force pushes and deletion are blocked, with no administrator bypass. Squash merge is the only enabled merge method. The initial single-maintainer policy requires zero external approvals so the maintainer can merge their own PR after checks pass; it does not allow direct pushes.
 
-The ruleset definition is versioned in [.github/rulesets/main.json](.github/rulesets/main.json). Repository settings are applied through GitHub administration; committing this file alone does not configure GitHub. Workflow tokens default to read-only and cannot approve pull requests. Secret scanning, push protection, Dependabot alerts/security updates, and private vulnerability reporting are enabled. Actions must be pinned to full commit SHAs.
+The ruleset definition is versioned in [.github/rulesets/main.json](.github/rulesets/main.json). Repository settings are applied through GitHub administration; committing this file alone does not configure GitHub. Workflow tokens default to read-only and cannot approve pull requests. Secret scanning, push protection, Dependabot vulnerability alerts, and private vulnerability reporting are enabled. Automatic Dependabot version-update and security-update pull requests are disabled. Actions must be pinned to full commit SHAs.
+
+Review dependency alerts and make updates manually. Scheduled CI dependency audits and CodeQL scans continue to run. Update CodeQL's `init` and `analyze` actions together to the same pinned release, since mixing their versions fails analysis.
 
 Before a release, validate provider behavior and deployment integration. Update `Cargo.toml` and `Cargo.lock` through a PR, then tag the merged commit with `vVERSION` and publish its GitHub release. The release workflow verifies tag/version/main ancestry, audits dependencies, tests and builds static binaries, and publishes assets with checksums and provenance. A manual dispatch on `main` exercises the build without publication.
 
