@@ -116,6 +116,20 @@ struct Browser {
     events: VecDeque<Value>,
 }
 impl Browser {
+    async fn navigate(&mut self, session: &str, url: &Url) -> AppResult<()> {
+        // Do not wait for navigation completion: an already approved provider
+        // can immediately redirect to our paused callback before that reply.
+        self.next_id += 1;
+        self.socket
+            .send(Message::Text(
+                json!({"id":self.next_id,"sessionId":session,
+            "method":"Page.navigate","params":{"url":url.as_str()}})
+                .to_string()
+                .into(),
+            ))
+            .await?;
+        Ok(())
+    }
     async fn receive(&mut self) -> AppResult<Value> {
         loop {
             match self.socket.next().await.ok_or("browser disconnected")?? {
@@ -343,7 +357,7 @@ pub async fn run(
         .to_owned();
     let result = tokio::time::timeout(APPROVAL_TIMEOUT, async {
         browser.command(Some(&session), "Fetch.enable", json!({"patterns":[{"urlPattern":format!("{}*", approval.redirect),"resourceType":"Document","requestStage":"Request"}]})).await?;
-        browser.command(Some(&session), "Page.navigate", json!({"url":approval.url.as_str()})).await?;
+        browser.navigate(&session, &approval.url).await?;
         println!("{}", json!({"event":"approval_requested","provider":provider.name()}));
         intercept(&mut browser, &session, &approval, &callback).await?;
         let outcome: broker::Outcome = http.post(control.join(&format!("v1/sessions/{}/wait", registered.id))?).timeout(APPROVAL_TIMEOUT).bearer_auth(&token).json(&broker::WaitRequest { wait_token }).send().await?.error_for_status()?.json().await?;
@@ -420,6 +434,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let navigation: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(navigation["method"], "Page.navigate");
+            // Do not acknowledge navigation until the callback is fulfilled:
+            // cached provider approval can redirect before navigation commits.
             // Other tabs are ignored, even if their URL resembles our callback.
             for session in ["unrelated-tab", "own-tab"] {
                 socket.send(Message::Text(json!({"sessionId":session,"method":"Fetch.requestPaused","params":{
@@ -452,6 +472,13 @@ mod tests {
             next_id: 0,
             events: VecDeque::new(),
         };
+        browser
+            .navigate(
+                "own-tab",
+                &Url::parse("https://accounts.google.com/o/oauth2/auth").unwrap(),
+            )
+            .await
+            .unwrap();
         intercept(
             &mut browser,
             "own-tab",
