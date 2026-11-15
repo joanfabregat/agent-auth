@@ -87,8 +87,7 @@ jobs:
         run: |
           target/release/agent-auth --version
           target/release/agent-auth serve --help
-          target/release/agent-auth login --help
-          target/release/agent-auth revoke --help
+          target/release/agent-auth capture --help
 
   secret-scan:
     name: Secret scan

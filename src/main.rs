@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod broker;
-mod login;
+mod capture;
 mod storage;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -10,12 +10,9 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_PENDING: usize = 128;
-
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn random_token() -> oauth2::CsrfToken {
-    // The relay requires at least 32 URL-safe characters. oauth2's default
-    // uses 16 random bytes (22 encoded characters), which it would reject.
     oauth2::CsrfToken::new_random_len(32)
 }
 
@@ -25,7 +22,6 @@ enum Provider {
     Google,
     Digitalocean,
 }
-
 impl Provider {
     fn name(self) -> &'static str {
         match self {
@@ -36,7 +32,10 @@ impl Provider {
 }
 
 #[derive(Parser)]
-#[command(version, about = "Private OAuth callback relay and cloud login client")]
+#[command(
+    version,
+    about = "Forward native cloud CLI approval callbacks through your browser"
+)]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -44,7 +43,7 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve browser callbacks and a separate, authenticated local control API.
+    /// Serve callbacks and a separate authenticated local control API.
     Serve {
         #[arg(long)]
         runtime_dir: PathBuf,
@@ -53,27 +52,21 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8054")]
         control_listen: SocketAddr,
     },
-    /// Request approval and exchange the code locally; never print credentials.
-    Login {
+    /// Open a CLI-generated login in Chrome and forward only its final callback.
+    Capture {
         #[arg(long, value_enum)]
         provider: Provider,
+        /// Owned mode-0600 file in a private tmpfs directory; never a token file.
         #[arg(long)]
-        client_file: PathBuf,
+        authorization_url_file: PathBuf,
         #[arg(long)]
         runtime_dir: PathBuf,
-        #[arg(long)]
-        session_dir: PathBuf,
         #[arg(long, default_value = "http://127.0.0.1:8054")]
         control_url: String,
+        #[arg(long, default_value = "http://127.0.0.1:9222")]
+        browser_url: String,
         #[arg(long)]
         callback_base: String,
-    },
-    /// Revoke session credentials and verify that they cannot be reused.
-    Revoke {
-        #[arg(long)]
-        client_file: PathBuf,
-        #[arg(long)]
-        session_dir: PathBuf,
     },
 }
 
@@ -85,32 +78,30 @@ async fn main() {
             callback_listen,
             control_listen,
         } => broker::serve(runtime_dir, callback_listen, control_listen).await,
-        Command::Login {
+        Command::Capture {
             provider,
-            client_file,
+            authorization_url_file,
             runtime_dir,
-            session_dir,
             control_url,
+            browser_url,
             callback_base,
         } => {
-            login::run(
+            capture::run(
                 provider,
-                client_file,
+                authorization_url_file,
                 runtime_dir,
-                session_dir,
                 control_url,
+                browser_url,
                 callback_base,
             )
             .await
         }
-        Command::Revoke {
-            client_file,
-            session_dir,
-        } => login::revoke(client_file, session_dir).await,
     };
-    if let Err(error) = result {
-        // All errors at credential boundaries are mapped to fixed messages.
-        eprintln!("agent-auth: {error}");
+    if result.is_err() {
+        // Network/CDP errors can contain authorization URLs. Never print them.
+        eprintln!(
+            "agent-auth: operation failed; check relay/browser availability and restart the isolated CLI login"
+        );
         std::process::exit(1);
     }
 }

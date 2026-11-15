@@ -6,61 +6,68 @@
 [![Rust edition](https://img.shields.io/badge/Rust-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 [![Status](https://img.shields.io/badge/status-experimental%20beta-yellow.svg)](https://github.com/joanfabregat/agent-auth/releases)
 
-Browser-approved OAuth for cloud command-line tools running on a remote agent host.
+Cloud CLIs usually redirect approval to a localhost listener. When the CLI runs on a remote agent host, that listener is on the wrong machine for your browser. `agent-auth` bridges that final callback to the CLI without copying codes into chat or registering another OAuth application.
 
-Cloud CLIs commonly redirect browser approval to `localhost`. That works when the browser and CLI share a machine, but a browser on your laptop cannot reach a listener bound to the remote agent host's loopback interface. `agent-auth` provides a shared HTTPS callback address that your browser can reach, so approval can finish without copying callback URLs into a conversation or forwarding a new SSH port for every login.
+**Status:** experimental beta. Native CLI callback handling is tested with synthetic browser, relay, and listener fixtures. A successful callback is not proof that a CLI authenticated: the wrapper must check CLI completion and the expected identity before allowing commands. Live provider validation is a separate deployment step.
 
-**Status:** experimental beta. The relay, login client, and revocation command are implemented and covered by local tests. [Versioned builds](https://github.com/joanfabregat/agent-auth/releases) are intended for controlled testing; this project does not provide a hosted authentication service or claim production readiness. Google and DigitalOcean login and revocation still need validation against real accounts before administrative use.
+## How it works
 
-## Intended workflow
+1. Your wrapper starts `gcloud auth login` in browser mode or `doctl auth login --no-browser`, using a fresh private CLI configuration.
+2. The wrapper saves the CLI's authorization URL in a mode-0600 file under a private tmpfs directory.
+3. `agent-auth capture` registers that URL's existing state and opens a new tab through your browser's existing Chrome DevTools Protocol (CDP) connection.
+4. You sign in and approve access yourself. The bridge never clicks consent buttons, reads cookies, or supplies credentials.
+5. The provider redirects to the CLI's **original registered localhost URI**. In this tab only, the bridge intercepts that navigation and responds with a redirect to your HTTPS callback relay.
+6. The relay delivers the bounded, one-use callback query to the bridge over its authenticated local control API. The bridge forwards it to the original CLI listener on the agent host.
+7. The CLI validates state/PKCE, exchanges the code, and stores its credentials in the isolated configuration. Your wrapper verifies login completion and account/team identity, controls commands, and revokes the session when done.
 
-1. An agent requests an elevated login through its local cloud wrapper.
-2. You open the provider's authorization URL and approve access in your own browser.
-3. The provider redirects your browser to your HTTPS callback endpoint.
-4. The callback relay delivers the one-use authorization code to the originating local login process.
-5. That process exchanges the code, verifies the expected account, and stores short-lived credentials in a private session on the agent host.
-6. The wrapper permits approved operations until the session is ended or expires, then revokes credentials and removes local state.
+**No new Google or DigitalOcean OAuth client is required.** The CLI keeps its built-in client, scopes, PKCE verifier, token exchange, and credential storage. `agent-auth` does not handle cloud access or refresh tokens. Versions before this architecture used a separate OAuth client; their `login` and `revoke` commands have been removed.
 
-The browser displays an approval receipt; it does not display cloud access or refresh tokens. Provider sign-in and MFA stay with the provider. An existing browser session may satisfy sign-in without requiring a new security-key touch.
+## Requirements
 
-## Architecture
+- Linux agent host with a private tmpfs runtime directory and the official cloud CLI.
+- Chrome on the human's machine, running with remote debugging and a dedicated profile. A private SSH remote forward exposes its CDP port on the agent host's loopback interface. Never expose CDP publicly: access to it controls your browser.
+- An HTTPS callback hostname reachable by the browser, optionally over a VPN. The provider redirects the browser; it does not connect to the callback server itself.
+- An isolated CLI wrapper that owns login supervision, identity verification, command approval, expiry, and verified revocation. This project transports callbacks; it is not a cloud authorization policy or session manager.
 
-The project is a Rust binary with two responsibilities:
+The browser bridge must already be connected before login capture starts. There is no browser extension or local browser-side server to install. A plain HTTPS server cannot substitute for this bridge because the stock clients' registered redirect URIs are localhost addresses.
 
-- **Callback relay:** an HTTP listener for browser callbacks, plus a separate authenticated control listener bound to loopback. It holds bounded, expiring pending requests and one-use authorization codes in memory. It does not need cloud access tokens, refresh tokens, or OAuth client secrets.
-- **Local login client:** generates PKCE and OAuth state, requests approval through the relay, exchanges the returned code directly with the provider, checks account identity, and writes credentials only to the originating private session.
+## Run
 
-Google Cloud and DigitalOcean are the initial provider adapters. Each provider needs its own registered OAuth client and exact HTTPS redirect URI. This is not a flag that changes the callback URL of an existing stock CLI login. Normal resource operations remain in `gcloud` or `doctl`; wrappers integrate the resulting credentials with those tools.
+Start the relay with an owned mode-0700 directory on tmpfs:
 
-A deployment might use:
-
-```text
-https://agent-auth.example.com/callback/google
-https://agent-auth.example.com/callback/digitalocean
+```sh
+agent-auth serve --runtime-dir /run/user/1000/agent-auth
 ```
 
-The browser must be able to reach these addresses. They can be VPN-only: the provider redirects the browser rather than making the callback request itself. TLS termination, DNS, VPN access, and OAuth client registration belong to the deployment. Host-specific configuration stays outside the reusable Rust implementation.
+Publish only its callback listener (`127.0.0.1:8053`) through your HTTPS proxy. Keep the control listener (`127.0.0.1:8054`) loopback-only. Disable proxy request logging, tracing, and metrics for this host, including error paths; callback URLs contain one-use secrets. Do not publish `/v1/` routes. The relay exits after five idle minutes, accepts at most 128 pending approvals, and expires pending requests after 30 minutes.
 
-## Access model
+Have your wrapper start a native CLI login in its isolated configuration and write its URL to a private file. For Google, use browser mode (`--launch-browser`); `--no-launch-browser` selects Google's copy/paste flow instead. A wrapper can supply a `BROWSER` opener that saves the URL rather than launching a browser on the remote host. Headless browser detection must recognize that opener. For DigitalOcean, `--no-browser` still starts its localhost listener. Preserve PKCE and never override the CLI's redirect URI or client ID.
 
-`agent-auth` is designed to complement an existing least-privilege identity: for example, a VM service account or a scoped read-only PAT. Elevated login is a separate operation requiring human browser approval. Credential availability does not itself authorize a command; enforce task approval in your agent tooling and actual permissions through cloud IAM, token scopes, and Kubernetes RBAC.
+Then start capture, substituting your actual private paths and hostname:
 
-The intended boundaries are:
+```sh
+agent-auth capture --provider google \
+  --authorization-url-file /run/user/1000/cloud-session/authorization.url \
+  --runtime-dir /run/user/1000/agent-auth \
+  --browser-url http://127.0.0.1:9222 \
+  --callback-base https://agent-auth.example.com
+```
 
-- Browser callbacks and local control operations use separate listeners. Publish only the callback listener through the reverse proxy.
-- PKCE, unpredictable state, provider binding, and one-use delivery bind each approval to its originating request.
-- Pending requests have an expiry and a capacity limit. Tokens and OAuth client secrets stay out of browser pages, URLs, logs, and command arguments.
-- Control secrets and credential files require owner-only permissions on a memory filesystem. The login process keeps provider credentials separate from relay state.
-- Agents sharing one Unix account are not isolated from each other by private paths alone. A hostile process with the same uid can generally access that account's files and processes.
-- Local expiry or deletion does not prove remote revocation. Provider-specific cleanup must be verified, including refresh-token behavior. A host or network failure can prevent remote cleanup.
+Use `--provider digitalocean` for `doctl`. Files must be owned mode-0600 regular files under owned mode-0700 tmpfs directories. URLs are read from files, never command arguments. Capture prints only fixed events (`approval_requested`, `callback_forwarded`); it never prints a callback code or token. A denial is forwarded to the CLI too.
 
-This is a security-sensitive component. Do not expose its control API publicly, copy production credentials into issues, or treat an untested provider integration as ready for privileged use.
+The completion page scrubs the query using a redirect to `/complete`. Its receipt confirms transport only. Wait for the CLI's exit status and verify the expected identity before using credentials. If capture fails or times out, close/revoke the wrapper session and restart the login; do not retry an old code.
 
-## Build
+## Security model
 
-The code targets Linux and the Rust 2024 edition. The first implementation uses Axum/Tokio for HTTP, the `oauth2` crate for authorization-code flow and PKCE, and Reqwest with Rustls for provider requests. Dependencies are locked and must be audited before execution.
+The relay and bridge bind each callback to its provider, exact original loopback destination, and CLI-generated state. They reject duplicate security parameters, conflicting code/error responses, token-bearing callbacks, unsafe endpoints, and oversized inputs. Delivery is one-use, bounded, and expiring. Browser interception is limited to the newly created tab and the exact callback address; other tabs are not inspected. All bridge HTTP endpoints remain loopback-only, with proxies and redirects disabled. The provider's authentication page is never proxied.
 
-Use Rust 1.99.0 on Linux:
+The browser CDP connection is privileged. The code uses only tab creation, navigation, callback interception, and detach commands, but a compromised bridge could abuse that connection. Use a dedicated browser profile. Same-uid processes on the agent host are outside the isolation boundary. Unix file permissions are operational guardrails, not isolation from a hostile agent sharing the same account.
+
+Credentials, cloud client registrations, provider access/refresh tokens, real identities, deployment hostnames, runtime state, and encrypted credential stores belong outside this public repository. Local deletion does not prove provider revocation. Your wrapper must retain enough private state to retry failed cleanup, and a host/network failure can prevent revocation.
+
+## Build, CI, and releases
+
+Use Rust 1.99.0 on Linux in an isolated build environment without credentials:
 
 ```sh
 cargo build --locked --release
@@ -69,84 +76,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ```
 
-Run these commands in an isolated build environment without cloud credentials. On managed agent hosts, use the host's approved container runner. The binary is `target/release/agent-auth`; it needs outbound HTTPS to the provider for login and revocation, but the relay itself does not.
+The implementation uses Axum/Tokio, Reqwest/Rustls for local HTTP, and tokio-tungstenite for CDP. The `oauth2` dependency supplies random opaque control tokens only; the program does not exchange provider grants. Dependencies are locked and audited before execution.
 
-## Configure and run
+Pull requests run formatting, Clippy, tests, native amd64/arm64 builds, dependency advisory/license/source checks, dependency review, a supplemental confidentiality scan, workflow linting, and CodeQL. Actions are pinned to commit SHAs. Scheduled checks and dependency alerts remain enabled; dependency updates are reviewed manually.
 
-Register separate OAuth applications for the providers you use. Google requires a **web application** OAuth client with a client secret for an HTTPS redirect; configure the consent screen and permitted users as appropriate. DigitalOcean requires an OAuth application configured for the authorization-code flow and PKCE. Register the exact corresponding callback URI shown above. Existing `gcloud` and `doctl` application registrations cannot be reused with arbitrary callback addresses.
-
-Create a private directory on Linux tmpfs, for example with `umask 077; mktemp -d /tmp/agent-auth-XXXXXXXX` on a host where `/tmp` is tmpfs. All runtime, session, and client-file parent directories must be owned by the current user, mode `0700`, and on tmpfs; secret files must be regular, owned files with mode `0600`. Files and directories are checked before use. Decrypt deployment secrets into that memory directory outside the repository; never pass their values as CLI arguments or commit encrypted credential stores here.
-
-The examples below use `/run/user/1000/agent-auth` as an illustrative tmpfs location. Create it and its `session` subdirectory with mode `0700` first; substitute your actual runtime directory.
-
-Client configuration is JSON. A Google configuration has these fields:
-
-```json
-{
-  "client_id": "YOUR_REGISTERED_CLIENT_ID",
-  "client_secret": "YOUR_CLIENT_SECRET",
-  "expected_email": "operator@example.com"
-}
-```
-
-A DigitalOcean configuration has these fields (`client_secret` may also be supplied for a confidential client):
-
-```json
-{
-  "client_id": "YOUR_REGISTERED_CLIENT_ID",
-  "expected_email": "operator@example.com",
-  "expected_team_id": "YOUR_EXPECTED_TEAM_UUID"
-}
-```
-
-Start the relay in a supervised, on-demand process:
-
-```sh
-agent-auth serve --runtime-dir /run/user/1000/agent-auth
-```
-
-The callback listener defaults to `127.0.0.1:8053`; the authenticated control listener defaults to `127.0.0.1:8054`. Both are restricted to loopback. Configure your HTTPS reverse proxy to forward **only** `/callback/google` and `/callback/digitalocean` to port `8053`, with optional `/healthz`. Never proxy port `8054`. Disable access logging or redact callback query strings: authorization codes and state appear in them. Avoid third-party scripts, analytics, and error reporting that capture callback URLs. TLS, DNS, proxy hardening, and VPN policy are deployment responsibilities.
-
-For example, to approve a DigitalOcean session:
-
-```sh
-agent-auth login --provider digitalocean \
-  --client-file /run/user/1000/agent-auth/digitalocean-client.json \
-  --runtime-dir /run/user/1000/agent-auth \
-  --session-dir /run/user/1000/agent-auth/session \
-  --callback-base https://agent-auth.example.com
-```
-
-Use `--provider google` with the Google client file for Google Cloud. Login prints a JSON `authorize` event containing the provider URL; open it in your browser. Approval waits up to 30 minutes. After token exchange and account verification, a JSON `ready` event reports the identity and session deadline. Credentials are never printed. Google requests `openid`, `email`, and `cloud-platform` with online access; DigitalOcean requests `read` and `write`. Google IAM and DigitalOcean account permissions still bound the actual access.
-
-The session contains private `grant.json`, `access-token`, and `ready.json` files, plus `doctl.yaml` for DigitalOcean. A wrapper can invoke `doctl --config SESSION/doctl.yaml --context elevated ...`, or `gcloud --access-token-file=SESSION/access-token ...` for Google. These are integration points, not complete elevated wrappers: **the wrapper must reject closed or unready sessions, check the deadline before every command, enforce task approval, and supervise expiry and cleanup.** The deadline is at most 45 minutes from the start of login, bounded by provider token expiry. The binary does not automatically shorten provider token lifetime or run a background revocation timer.
-
-End a session with:
-
-```sh
-agent-auth revoke \
-  --client-file /run/user/1000/agent-auth/digitalocean-client.json \
-  --session-dir /run/user/1000/agent-auth/session
-```
-
-Revocation marks the session closed before contacting the provider and verifies that access and any refresh credentials are rejected. Successful cleanup removes local credential files. If verification fails, the closed session is retained for retry or provider-side application revocation. A login failure after token issuance can also retain `grant.json` for cleanup; do not simply delete it. A process or host failure can prevent remote revocation. Encrypted-at-rest client configuration, session supervision, and recovery procedures belong in the deployment, outside this repository.
-
-The relay exits after five idle minutes with no pending approvals and responds to SIGINT/SIGTERM. Pending requests expire after 30 minutes; at most 128 are accepted. Stopping the relay does not revoke grants held by login sessions.
-
-## CI and releases
-
-Pull requests run formatting, Clippy, tests and release builds on Linux amd64 and arm64, dependency advisory/license/source checks, dependency review, a supplemental confidentiality scan, workflow linting, and CodeQL for Rust and GitHub Actions. Scheduled checks detect newly disclosed dependency and workflow issues. Actions are pinned to commit SHAs, and routine jobs have a read-only repository token.
-
-Publishing a GitHub release tagged `vVERSION` builds static Linux amd64/arm64 archives after checking that the tag matches `Cargo.toml` and belongs to `main`. Archives include the README, MIT license, and security policy. The workflow publishes SHA-256 checksums and GitHub build provenance attestations; verify both before installation. Its manual dispatch on `main` builds artifacts as a dry run without publishing a release. Release jobs do not use deployment or cloud credentials.
-
-See [SECURITY.md](SECURITY.md) for private vulnerability reporting, trust boundaries, and confidentiality rules. See [CONTRIBUTING.md](CONTRIBUTING.md) for review and repository protection policy.
-
-## Roadmap
-
-- Validate Google Cloud and DigitalOcean login, identity checks, credential handoff, expiry, and revocation.
-- Complete deployment supervision and integration with existing cloud wrappers.
-- Publish a stable release after those checks pass.
-
-## License
-
-[MIT](LICENSE). Copyright 2026 Joan Fabregat.
+Publishing a tagged GitHub release builds static Linux amd64/arm64 archives, SHA-256 checksums, and GitHub provenance attestations. Verify the checksums and attestations before installation. Release builds do not receive cloud credentials. See [SECURITY.md](SECURITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and the [MIT license](LICENSE).

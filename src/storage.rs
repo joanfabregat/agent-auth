@@ -46,26 +46,6 @@ pub fn write_new(path: &Path, value: &[u8]) -> AppResult<()> {
     Ok(())
 }
 
-pub fn replace_secret(path: &Path, value: &[u8]) -> AppResult<()> {
-    if !path.exists() {
-        return write_new(path, value);
-    }
-    read_secret(path)?;
-    let temporary = path.with_file_name(format!(
-        ".replacement-{}",
-        oauth2::CsrfToken::new_random().secret()
-    ));
-    let result = (|| {
-        write_new(&temporary, value)?;
-        fs::rename(&temporary, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,8 +65,6 @@ mod tests {
         write_new(&secret, b"fixture").unwrap();
         assert_eq!(read_secret(&secret).unwrap(), "fixture");
         assert!(write_new(&secret, b"replacement").is_err());
-        replace_secret(&secret, b"rotated-fixture").unwrap();
-        assert_eq!(read_secret(&secret).unwrap(), "rotated-fixture");
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&secret, &link).unwrap();
         assert!(read_secret(&link).is_err());

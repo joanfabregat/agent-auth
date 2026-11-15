@@ -1,7 +1,7 @@
 use crate::{APPROVAL_TIMEOUT, AppResult, MAX_PENDING, Provider, storage};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, RawQuery, State},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -38,6 +38,7 @@ pub struct WaitRequest {
 pub struct Outcome {
     pub code: Option<String>,
     pub denied: bool,
+    pub query: Option<String>,
 }
 
 struct Pending {
@@ -66,6 +67,45 @@ fn opaque(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
+pub fn valid_state(value: &str) -> bool {
+    (16..=512).contains(&value.len())
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-.~".contains(&c))
+}
+
+pub fn validate_query(raw: &str) -> Result<String, &'static str> {
+    if raw.len() > 8192 || raw.contains(['\r', '\n', '#']) {
+        return Err("invalid callback query");
+    }
+    let fields: Vec<_> = url::form_urlencoded::parse(raw.as_bytes()).collect();
+    let values = |name: &str| -> Vec<&str> {
+        fields
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_ref())
+            .collect()
+    };
+    let state = values("state");
+    let code = values("code");
+    let error = values("error");
+    if state.len() != 1
+        || !valid_state(state[0])
+        || fields.iter().any(|(key, value)| {
+            matches!(key.as_ref(), "access_token" | "refresh_token")
+                || value.contains(['\r', '\n', '\0'])
+        })
+        || !((code.len() == 1 && !code[0].is_empty() && code[0].len() <= 4096 && error.is_empty())
+            || (error.len() == 1
+                && !error[0].is_empty()
+                && error[0].len() <= 512
+                && code.is_empty()))
+    {
+        return Err("invalid callback parameters");
+    }
+    Ok(state[0].to_owned())
+}
+
 fn authorized(headers: &HeaderMap, broker: &Broker) -> Result<(), StatusCode> {
     let provided = headers
         .get(header::AUTHORIZATION)
@@ -85,7 +125,7 @@ async fn register(
     Json(input): Json<Registration>,
 ) -> Result<Json<Registered>, StatusCode> {
     authorized(&headers, &broker)?;
-    if !opaque(&input.state) || !opaque(&input.wait_token) {
+    if !valid_state(&input.state) || !opaque(&input.wait_token) {
         return Err(StatusCode::BAD_REQUEST);
     }
     let mut inner = broker.inner.lock().await;
@@ -156,13 +196,6 @@ async fn wait(
     }
 }
 
-#[derive(Deserialize)]
-struct Callback {
-    state: Option<String>,
-    code: Option<String>,
-    error: Option<String>,
-}
-
 fn page(status: StatusCode, text: &'static str) -> Response {
     let mut response = (status, Html(text)).into_response();
     let headers = response.headers_mut();
@@ -181,9 +214,10 @@ fn page(status: StatusCode, text: &'static str) -> Response {
 async fn callback(
     State(broker): State<Arc<Broker>>,
     Path(provider): Path<String>,
-    Query(input): Query<Callback>,
+    RawQuery(raw): RawQuery,
 ) -> Response {
-    let Some(state) = input.state.filter(|state| opaque(state)) else {
+    let raw = raw.unwrap_or_default();
+    let Ok(state) = validate_query(&raw) else {
         return page(StatusCode::BAD_REQUEST, "Invalid approval response.");
     };
     let mut inner = broker.inner.lock().await;
@@ -200,21 +234,13 @@ async fn callback(
         );
     }
     // Never echo provider-supplied error text or authorization codes to HTML.
-    let outcome = if input.error.is_some() {
-        Outcome {
-            code: None,
-            denied: true,
-        }
-    } else if let Some(code) = input
-        .code
-        .filter(|code| !code.is_empty() && code.len() <= 4096)
-    {
-        Outcome {
-            code: Some(code),
-            denied: false,
-        }
-    } else {
-        return page(StatusCode::BAD_REQUEST, "Missing approval code.");
+    let fields: HashMap<_, _> = url::form_urlencoded::parse(raw.as_bytes())
+        .into_owned()
+        .collect();
+    let outcome = Outcome {
+        code: fields.get("code").cloned(),
+        denied: fields.contains_key("error"),
+        query: Some(raw),
     };
     let Some(sender) = pending.sender.take() else {
         return page(StatusCode::CONFLICT, "This approval was already received.");
@@ -226,15 +252,17 @@ async fn callback(
         );
     }
     inner.last_activity = Instant::now();
-    page(
-        StatusCode::OK,
-        "<!doctype html><meta charset=utf-8><title>Approval received</title><h1>Approval received</h1><p>You can return to your agent. It will verify the account and complete the login.</p>",
-    )
+    let mut response = page(StatusCode::SEE_OTHER, "Approval received.");
+    response
+        .headers_mut()
+        .insert(header::LOCATION, "/complete".parse().unwrap());
+    response
 }
 
 fn routers(broker: Arc<Broker>) -> (Router, Router) {
     let callbacks = Router::new()
         .route("/callback/{provider}", get(callback))
+        .route("/complete", get(|| async { page(StatusCode::OK, "<!doctype html><meta charset=utf-8><title>Approval received</title><h1>Approval received</h1><p>Return to your agent. The cloud CLI will verify and finish login.</p>") }))
         .route("/healthz", get(|| async { "ready" }))
         .with_state(broker.clone());
     let control = Router::new()
@@ -327,6 +355,25 @@ pub async fn serve(
 mod tests {
     use super::*;
 
+    #[test]
+    fn rejects_ambiguous_token_bearing_and_unbounded_queries() {
+        let state = "synthetic-native-state-1234567890";
+        for raw in [
+            format!("state={state}&state={state}&code=x"),
+            format!("state={state}&code=x&code=y"),
+            format!("state={state}&code=x&error=denied"),
+            format!("state={state}&code=x&access_token=fixture"),
+            format!("state={state}&code=%0D%0Afixture"),
+            format!("state={state}&code={}", "x".repeat(8192)),
+        ] {
+            assert!(validate_query(&raw).is_err());
+        }
+        assert_eq!(
+            validate_query(&format!("state={state}&code=x%2By&scope=one%20two")).unwrap(),
+            state
+        );
+    }
+
     fn broker() -> Arc<Broker> {
         Arc::new(Broker {
             control_token: "fixture-control".into(),
@@ -371,14 +418,10 @@ mod tests {
         let response = callback(
             State(broker.clone()),
             Path("digitalocean".into()),
-            Query(Callback {
-                state: Some(state),
-                code: Some("synthetic-approval".into()),
-                error: None,
-            }),
+            RawQuery(Some(format!("state={state}&code=synthetic-approval"))),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let Json(outcome) = wait(
             State(broker),
             headers(),
@@ -418,33 +461,21 @@ mod tests {
         let wrong = callback(
             State(state.clone()),
             Path("digitalocean".into()),
-            Query(Callback {
-                state: Some("a".repeat(43)),
-                code: Some("fixture-code".into()),
-                error: None,
-            }),
+            RawQuery(Some(format!("state={}&code=fixture-code", "a".repeat(43)))),
         )
         .await;
         assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
         let accepted = callback(
             State(state.clone()),
             Path("google".into()),
-            Query(Callback {
-                state: Some("a".repeat(43)),
-                code: Some("fixture-code".into()),
-                error: None,
-            }),
+            RawQuery(Some(format!("state={}&code=fixture-code", "a".repeat(43)))),
         )
         .await;
-        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
         let replay = callback(
             State(state.clone()),
             Path("google".into()),
-            Query(Callback {
-                state: Some("a".repeat(43)),
-                code: Some("other-code".into()),
-                error: None,
-            }),
+            RawQuery(Some(format!("state={}&code=other-code", "a".repeat(43)))),
         )
         .await;
         assert_eq!(replay.status(), StatusCode::CONFLICT);
@@ -490,11 +521,7 @@ mod tests {
         let response = callback(
             State(state),
             Path("google".into()),
-            Query(Callback {
-                state: Some("a".repeat(43)),
-                code: Some("fixture-code".into()),
-                error: None,
-            }),
+            RawQuery(Some(format!("state={}&code=fixture-code", "a".repeat(43)))),
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
